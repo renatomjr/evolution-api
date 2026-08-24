@@ -125,6 +125,7 @@ import makeWASocket, {
   MessageUpsertType,
   MessageUserReceiptUpdate,
   MiscMessageGenerationOptions,
+  normalizeMessageContent,
   ParticipantAction,
   prepareWAMessageMedia,
   Product,
@@ -5237,7 +5238,7 @@ export class BaileysStartupService extends ChannelStartupService {
       source: getDevice(keyAny.id),
       instanceId: this.instanceId,
       status: status[message.status],
-      contextInfo: this.deserializeMessageBuffers(message.message?.messageContextInfo),
+      contextInfo: this.deserializeMessageBuffers(this.extractMessageContextInfo(message.message)),
     };
 
     if (!messageRaw.status && message.key.fromMe === false) {
@@ -5274,6 +5275,18 @@ export class BaileysStartupService extends ChannelStartupService {
     }
 
     return messageRaw;
+  }
+
+  private extractMessageContextInfo(
+    message: proto.IMessage | null | undefined,
+  ): proto.IContextInfo | proto.IMessageContextInfo | undefined {
+    const normalizedMessage = normalizeMessageContent(message);
+    const contentType = getContentType(normalizedMessage);
+    const content = contentType
+      ? (normalizedMessage?.[contentType] as { contextInfo?: proto.IContextInfo } | null | undefined)
+      : null;
+
+    return content?.contextInfo ?? normalizedMessage?.messageContextInfo ?? undefined;
   }
 
   private async syncChatwootLostMessages() {
