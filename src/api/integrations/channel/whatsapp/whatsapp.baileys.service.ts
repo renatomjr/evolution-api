@@ -1391,7 +1391,8 @@ export class BaileysStartupService extends ChannelStartupService {
             }
           }
 
-          const messageRaw = this.prepareMessage(received) as any;
+          const normalizedMessage = normalizeMessageContent(received.message) ?? received.message ?? {};
+          const messageRaw = this.prepareMessage(received, normalizedMessage) as any;
 
           if (messageRaw.messageType === 'pollUpdateMessage') {
             const pollCreationKey = (messageRaw.message as any).pollUpdateMessage.pollCreationMessageKey;
@@ -1494,16 +1495,8 @@ export class BaileysStartupService extends ChannelStartupService {
             }
           }
 
-          const isMedia =
-            received?.message?.imageMessage ||
-            received?.message?.videoMessage ||
-            received?.message?.stickerMessage ||
-            received?.message?.documentMessage ||
-            received?.message?.documentWithCaptionMessage ||
-            received?.message?.ptvMessage ||
-            received?.message?.audioMessage;
-
-          const isVideo = received?.message?.videoMessage;
+          const isMedia = TypeMediaMessage.includes(messageRaw.messageType);
+          const isVideo = messageRaw.messageType === 'videoMessage';
 
           if (this.localSettings.readMessages && received.key.id !== 'status@broadcast') {
             await this.client.readMessages([received.key]);
@@ -1531,7 +1524,7 @@ export class BaileysStartupService extends ChannelStartupService {
             }
           }
 
-          if (this.configService.get<Openai>('OPENAI').ENABLED && received?.message?.audioMessage) {
+          if (this.configService.get<Openai>('OPENAI').ENABLED && normalizedMessage.audioMessage) {
             const openAiDefaultSettings = await this.prismaRepository.openaiSetting.findFirst({
               where: { instanceId: this.instanceId },
               include: { OpenaiCreds: true },
@@ -1584,7 +1577,7 @@ export class BaileysStartupService extends ChannelStartupService {
                   this.logger.warn('Video upload is disabled. Skipping video upload.');
                   return;
                 } else {
-                  const message: any = received;
+                  const message: any = { ...received, message: normalizedMessage };
 
                   // Verificação adicional para garantir que há conteúdo de mídia real
                   const hasRealMedia = this.hasValidMediaContent(message);
@@ -1640,7 +1633,7 @@ export class BaileysStartupService extends ChannelStartupService {
             if (isMedia && this.localWebhook.webhookBase64) {
               try {
                 const buffer = await downloadMediaMessage(
-                  { key: received.key, message: received?.message },
+                  { key: received.key, message: normalizedMessage },
                   'buffer',
                   {},
                   { logger: P({ level: 'error' }) as any, reuploadRequest: this.client.updateMediaMessage },
@@ -1651,7 +1644,7 @@ export class BaileysStartupService extends ChannelStartupService {
                 } else {
                   // retry to download media
                   const buffer = await downloadMediaMessage(
-                    { key: received.key, message: received?.message },
+                    { key: received.key, message: normalizedMessage },
                     'buffer',
                     {},
                     { logger: P({ level: 'error' }) as any, reuploadRequest: this.client.updateMediaMessage },
@@ -5217,8 +5210,9 @@ export class BaileysStartupService extends ChannelStartupService {
     return obj;
   }
 
-  private prepareMessage(message: WAMessage): Message {
+  private prepareMessage(message: WAMessage, normalizedMessage?: proto.IMessage): Message {
     const keyAny = message.key as any;
+    const messageContent = normalizedMessage ?? normalizeMessageContent(message.message) ?? message.message ?? {};
     const messageRaw: any = {
       key: {
         ...message.key,
@@ -5230,15 +5224,15 @@ export class BaileysStartupService extends ChannelStartupService {
         (message.key.fromMe
           ? 'Você'
           : message?.participant || (message.key?.participant ? message.key.participant.split('@')[0] : null)),
-      message: this.deserializeMessageBuffers({ ...message.message }),
-      messageType: getContentType(message.message),
+      message: this.deserializeMessageBuffers({ ...messageContent }),
+      messageType: getContentType(messageContent),
       messageTimestamp: Long.isLong(message.messageTimestamp)
         ? message.messageTimestamp.toNumber()
         : (message.messageTimestamp as number),
       source: getDevice(keyAny.id),
       instanceId: this.instanceId,
       status: status[message.status],
-      contextInfo: this.deserializeMessageBuffers(this.extractMessageContextInfo(message.message)),
+      contextInfo: this.deserializeMessageBuffers(this.extractMessageContextInfo(messageContent)),
     };
 
     if (!messageRaw.status && message.key.fromMe === false) {
@@ -5249,12 +5243,6 @@ export class BaileysStartupService extends ChannelStartupService {
       messageRaw.messageType = 'conversation';
       messageRaw.message.conversation = messageRaw.message.extendedTextMessage.text;
       delete messageRaw.message.extendedTextMessage;
-    }
-
-    if (messageRaw.message.documentWithCaptionMessage) {
-      messageRaw.messageType = 'documentMessage';
-      messageRaw.message.documentMessage = messageRaw.message.documentWithCaptionMessage.message.documentMessage;
-      delete messageRaw.message.documentWithCaptionMessage;
     }
 
     const quotedMessage = messageRaw?.contextInfo?.quotedMessage;
