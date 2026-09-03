@@ -257,8 +257,23 @@ export class WAMonitoringService {
           businessId: data.businessId,
         },
       });
+      // Create the default settings before integrations can handle events for the new instance.
+      await this.prismaRepository.setting.upsert({
+        where: { instanceId: data.instanceId },
+        update: {},
+        create: {
+          instanceId: data.instanceId,
+          rejectCall: false,
+          groupsIgnore: false,
+          alwaysOnline: false,
+          readMessages: false,
+          readStatus: false,
+          syncFullHistory: false,
+        },
+      });
     } catch (error) {
       this.logger.error(error);
+      throw error;
     }
   }
 
