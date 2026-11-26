@@ -124,6 +124,7 @@ import makeWASocket, {
   MessageUpsertType,
   MessageUserReceiptUpdate,
   MiscMessageGenerationOptions,
+  normalizeMessageContent,
   ParticipantAction,
   prepareWAMessageMedia,
   Product,
@@ -1389,7 +1390,8 @@ export class BaileysStartupService extends ChannelStartupService {
             }
           }
 
-          const messageRaw = this.prepareMessage(received) as any;
+          const normalizedMessage = normalizeMessageContent(received.message) ?? received.message ?? {};
+          const messageRaw = this.prepareMessage(received, normalizedMessage) as any;
 
           if (messageRaw.messageType === 'pollUpdateMessage') {
             const pollCreationKey = (messageRaw.message as any).pollUpdateMessage.pollCreationMessageKey;
@@ -1492,16 +1494,8 @@ export class BaileysStartupService extends ChannelStartupService {
             }
           }
 
-          const isMedia =
-            received?.message?.imageMessage ||
-            received?.message?.videoMessage ||
-            received?.message?.stickerMessage ||
-            received?.message?.documentMessage ||
-            received?.message?.documentWithCaptionMessage ||
-            received?.message?.ptvMessage ||
-            received?.message?.audioMessage;
-
-          const isVideo = received?.message?.videoMessage;
+          const isMedia = TypeMediaMessage.includes(messageRaw.messageType);
+          const isVideo = messageRaw.messageType === 'videoMessage';
 
           if (this.localSettings.readMessages && received.key.id !== 'status@broadcast') {
             await this.client.readMessages([received.key]);
@@ -1529,7 +1523,7 @@ export class BaileysStartupService extends ChannelStartupService {
             }
           }
 
-          if (this.configService.get<Openai>('OPENAI').ENABLED && received?.message?.audioMessage) {
+          if (this.configService.get<Openai>('OPENAI').ENABLED && normalizedMessage.audioMessage) {
             const openAiDefaultSettings = await this.prismaRepository.openaiSetting.findFirst({
               where: { instanceId: this.instanceId },
               include: { OpenaiCreds: true },
@@ -1541,10 +1535,11 @@ export class BaileysStartupService extends ChannelStartupService {
             }
           }
 
+          let msg: Message | null = null;
           if (this.configService.get<Database>('DATABASE').SAVE_DATA.NEW_MESSAGE) {
             // eslint-disable-next-line @typescript-eslint/no-unused-vars
             const { pollUpdates, ...messageData } = messageRaw as any;
-            const msg = await this.prismaRepository.message.create({ data: messageData });
+            msg = await this.prismaRepository.message.create({ data: messageData });
 
             const { remoteJid } = received.key;
             const timestamp = msg.messageTimestamp;
@@ -1572,17 +1567,16 @@ export class BaileysStartupService extends ChannelStartupService {
             } else {
               this.logger.info(`Update readed messages duplicated ignored [avoid deadlock]: ${messageKey}`);
             }
+          }
 
-            if (isMedia) {
-              if (this.configService.get<S3>('S3').ENABLE) {
-                try {
-                  if (isVideo && !this.configService.get<S3>('S3').SAVE_VIDEO) {
-                    this.logger.warn('Video upload is disabled. Skipping video upload.');
-                    // Skip video upload by returning early from this block
-                    return;
-                  }
-
-                  const message: any = received;
+          if (isMedia) {
+            if (this.configService.get<S3>('S3').ENABLE) {
+              try {
+                if (isVideo && !this.configService.get<S3>('S3').SAVE_VIDEO) {
+                  this.logger.warn('Video upload is disabled. Skipping video upload.');
+                  return;
+                } else {
+                  const message: any = { ...received, message: normalizedMessage };
 
                   // Verificação adicional para garantir que há conteúdo de mídia real
                   const hasRealMedia = this.hasValidMediaContent(message);
@@ -1595,37 +1589,41 @@ export class BaileysStartupService extends ChannelStartupService {
                     if (!media) {
                       this.logger.verbose('No valid media to upload (messageContextInfo only), skipping MinIO');
                       return;
+                    } else {
+                      const { buffer, mediaType, fileName, size } = media;
+                      const mimetype = mimeTypes.lookup(fileName).toString();
+                      const fullName = join(
+                        `${this.instance.id}`,
+                        received.key.remoteJid,
+                        mediaType,
+                        `${Date.now()}_${fileName}`,
+                      );
+                      await s3Service.uploadFile(fullName, buffer, size.fileLength?.low, { 'Content-Type': mimetype });
+
+                      if (msg?.id) {
+                        await this.prismaRepository.media.create({
+                          data: {
+                            messageId: msg.id,
+                            instanceId: this.instanceId,
+                            type: mediaType,
+                            fileName: fullName,
+                            mimetype,
+                          },
+                        });
+                      }
+
+                      const mediaUrl = await s3Service.getObjectUrl(fullName);
+
+                      (messageRaw.message as any).mediaUrl = mediaUrl;
+
+                      if (msg?.id) {
+                        await this.prismaRepository.message.update({ where: { id: msg.id }, data: messageRaw });
+                      }
                     }
-
-                    const { buffer, mediaType, fileName, size } = media;
-                    const mimetype = mimeTypes.lookup(fileName).toString();
-                    const fullName = join(
-                      `${this.instance.id}`,
-                      received.key.remoteJid,
-                      mediaType,
-                      `${Date.now()}_${fileName}`,
-                    );
-                    await s3Service.uploadFile(fullName, buffer, size.fileLength?.low, { 'Content-Type': mimetype });
-
-                    await this.prismaRepository.media.create({
-                      data: {
-                        messageId: msg.id,
-                        instanceId: this.instanceId,
-                        type: mediaType,
-                        fileName: fullName,
-                        mimetype,
-                      },
-                    });
-
-                    const mediaUrl = await s3Service.getObjectUrl(fullName);
-
-                    (messageRaw.message as any).mediaUrl = mediaUrl;
-
-                    await this.prismaRepository.message.update({ where: { id: msg.id }, data: messageRaw });
                   }
-                } catch (error) {
-                  this.logger.error(['Error on upload file to minio', error?.message, error?.stack]);
                 }
+              } catch (error) {
+                this.logger.error(['Error on upload file to minio', error?.message, error?.stack]);
               }
             }
           }
@@ -1634,7 +1632,7 @@ export class BaileysStartupService extends ChannelStartupService {
             if (isMedia && this.localWebhook.webhookBase64) {
               try {
                 const buffer = await downloadMediaMessage(
-                  { key: received.key, message: received?.message },
+                  { key: received.key, message: normalizedMessage },
                   'buffer',
                   {},
                   { logger: P({ level: 'error' }) as any, reuploadRequest: this.client.updateMediaMessage },
@@ -1645,7 +1643,7 @@ export class BaileysStartupService extends ChannelStartupService {
                 } else {
                   // retry to download media
                   const buffer = await downloadMediaMessage(
-                    { key: received.key, message: received?.message },
+                    { key: received.key, message: normalizedMessage },
                     'buffer',
                     {},
                     { logger: P({ level: 'error' }) as any, reuploadRequest: this.client.updateMediaMessage },
@@ -1673,7 +1671,6 @@ export class BaileysStartupService extends ChannelStartupService {
 
             messageRaw.key.addressingMode = 'pn';
           }
-          console.log(messageRaw);
 
           this.sendDataWebhook(Events.MESSAGES_UPSERT, messageRaw);
 
@@ -5153,8 +5150,9 @@ export class BaileysStartupService extends ChannelStartupService {
     return obj;
   }
 
-  private prepareMessage(message: WAMessage): Message {
+  private prepareMessage(message: WAMessage, normalizedMessage?: proto.IMessage): Message {
     const keyAny = message.key as any;
+    const messageContent = normalizedMessage ?? normalizeMessageContent(message.message) ?? message.message ?? {};
     const messageRaw: any = {
       key: {
         ...message.key,
@@ -5166,15 +5164,15 @@ export class BaileysStartupService extends ChannelStartupService {
         (message.key.fromMe
           ? 'Você'
           : message?.participant || (message.key?.participant ? message.key.participant.split('@')[0] : null)),
-      message: this.deserializeMessageBuffers({ ...message.message }),
-      messageType: getContentType(message.message),
+      message: this.deserializeMessageBuffers({ ...messageContent }),
+      messageType: getContentType(messageContent),
       messageTimestamp: Long.isLong(message.messageTimestamp)
         ? message.messageTimestamp.toNumber()
         : (message.messageTimestamp as number),
       source: getDevice(keyAny.id),
       instanceId: this.instanceId,
       status: status[message.status],
-      contextInfo: this.deserializeMessageBuffers(message.message?.messageContextInfo),
+      contextInfo: this.deserializeMessageBuffers(this.extractMessageContextInfo(messageContent)),
     };
 
     if (!messageRaw.status && message.key.fromMe === false) {
@@ -5185,12 +5183,6 @@ export class BaileysStartupService extends ChannelStartupService {
       messageRaw.messageType = 'conversation';
       messageRaw.message.conversation = messageRaw.message.extendedTextMessage.text;
       delete messageRaw.message.extendedTextMessage;
-    }
-
-    if (messageRaw.message.documentWithCaptionMessage) {
-      messageRaw.messageType = 'documentMessage';
-      messageRaw.message.documentMessage = messageRaw.message.documentWithCaptionMessage.message.documentMessage;
-      delete messageRaw.message.documentWithCaptionMessage;
     }
 
     const quotedMessage = messageRaw?.contextInfo?.quotedMessage;
@@ -5211,6 +5203,18 @@ export class BaileysStartupService extends ChannelStartupService {
     }
 
     return messageRaw;
+  }
+
+  private extractMessageContextInfo(
+    message: proto.IMessage | null | undefined,
+  ): proto.IContextInfo | proto.IMessageContextInfo | undefined {
+    const normalizedMessage = normalizeMessageContent(message);
+    const contentType = getContentType(normalizedMessage);
+    const content = contentType
+      ? (normalizedMessage?.[contentType] as { contextInfo?: proto.IContextInfo } | null | undefined)
+      : null;
+
+    return content?.contextInfo ?? normalizedMessage?.messageContextInfo ?? undefined;
   }
 
   private async syncChatwootLostMessages() {
