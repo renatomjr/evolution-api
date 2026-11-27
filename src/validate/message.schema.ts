@@ -163,6 +163,7 @@ export const audioMessageSchema: JSONSchema7 = {
   properties: {
     number: { ...numberDefinition },
     audio: { type: 'string' },
+    messageId: { type: 'string' },
     delay: {
       type: 'integer',
       description: 'Enter a value in milliseconds',

@@ -3537,6 +3537,13 @@ export class BaileysStartupService extends ChannelStartupService {
       data.encoding = true;
     }
 
+    const options: Options = {
+      presence: 'recording',
+      delay: data?.delay,
+      quoted: data?.quoted,
+      messageId: data?.messageId,
+    };
+
     if (data?.encoding) {
       const convert = await this.processAudio(mediaData.audio);
 
@@ -3547,7 +3554,7 @@ export class BaileysStartupService extends ChannelStartupService {
         const result = this.sendMessageWithTyping<AnyMessageContent>(
           data.number,
           messageContent as any,
-          { presence: 'recording', delay: data?.delay, quoted: data?.quoted },
+          options,
           isIntegration,
         );
 
@@ -3567,7 +3574,7 @@ export class BaileysStartupService extends ChannelStartupService {
         ptt: true,
         mimetype: 'audio/ogg; codecs=opus',
       },
-      { presence: 'recording', delay: data?.delay, quoted: data?.quoted },
+      options,
       isIntegration,
     );
   }
